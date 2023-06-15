@@ -7,6 +7,7 @@ import random
 import functools
 import collections
 import math
+import enum
 
 MAX_RATING = 5
 
@@ -55,12 +56,9 @@ class StationaryRecommender:
     
 
 class DiscreteSimulationResult:
-    def __init__(self, events, n_events, total_wellbeing, avg_rating, last_interaction_time, T):
+    def __init__(self, events, aggregated_results, T):
         self.raw_events = events
-        self.n_events = n_events
-        self.total_wellbeing = total_wellbeing
-        self.avg_rating = avg_rating
-        self.last_interaction_time = last_interaction_time
+        self.agg = aggregated_results
         self.T = T
         self._df = None
         
@@ -70,13 +68,7 @@ class DiscreteSimulationResult:
             self._df = (
                 pd.DataFrame(
                     data=self.raw_events,
-                    columns=[
-                        't',
-                        'latent_state',
-                        'recommendations',
-                        'avg_beta',
-                        'avg_delta',
-                    ]
+                    columns=self.raw_events[0]._fields,
                 )
                 .assign(
                     # lambda_i=lambda df: 1/df['t'].diff(),
@@ -90,16 +82,13 @@ class DiscreteSimulationResult:
         return self._df
         
     def empirical_rate(self):
-        return self.n_events/self.T
-
-    def empirical_wellbeing(self):
-        return self.total_wellbeing/self.T
+        return self.agg.n_events/self.T
 
     def average_rating(self):
-        return self.avg_rating
+        return self.agg.avg_rating
 
     def survival_pct(self):
-        return self.last_interaction_time/self.T
+        return self.agg.last_interaction_time/self.T
 
 
 class IVP:
@@ -129,33 +118,63 @@ class LotkaVolterraDynamicalSystem:
         )
         return ode_solver_result
 
-    def simulate_discrete(self, ivp, recommender, batch_size=1, record_events=True, rate_limit_params=None):
+    def simulate_discrete(self, ivp, recommender, batch_size=1, record_events=True, rate_limit_params=None, adaptive_policy_params=None):
         # make sure events are recorded if rate limits are applied
         assert record_events or rate_limit_params is None
-        # run optimized discrete simulation
-        events, agg = _simulate_discrete_optimized(
-            alpha=self.alpha,
-            beta=tuple(self.beta),
-            gamma=self.gamma,
-            delta=self.delta,
-            y_0=ivp.y_0,
-            T=ivp.T,
-            p_fb=recommender.p_fb,
+        simulate = lambda t0, T, p_fb: _simulate_discrete_optimized(
+            lv_params=LotkaVolterraSystemParams(
+                alpha=self.alpha,
+                beta=tuple(self.beta),
+                gamma=self.gamma,
+                delta=self.delta,
+            ),
+            y0=ivp.y_0,
+            t0=t0,
+            T=T,
+            p_fb=p_fb,
             item_probabilities=recommender.item_probabilities(),
             true_ratings=recommender.true_ratings,
             batch_size=batch_size,
             rate_limit_params=rate_limit_params,
+            adaptive_policy_params=None if adaptive_policy_params is None else _AdaptiveRatingsPolicyInternalParams(
+                rating_sampling_rate=adaptive_policy_params.rating_sampling_rate,
+            ),
             record_events=record_events,
         )
+        # run optimized discrete simulation
+        events0, agg0 = simulate(
+            t0=0.0,
+            T=ivp.T if adaptive_policy_params is None else adaptive_policy_params.callback_time,
+            p_fb=recommender.p_fb,
+        )
+        if adaptive_policy_params is not None:
+            events1, agg1 = simulate(
+                t0=agg0.next_interaction_time,
+                T=ivp.T,
+                p_fb=adaptive_policy_params.callback_f(events0, agg0),
+            )
+            events = events0+events1 if record_events else None
+            agg = AggregatedSimulationResult(
+                n_events=agg0.n_events + agg1.n_events,
+                total_non_empty=agg0.total_non_empty + agg1.total_non_empty,
+                avg_rating=(
+                    (agg0.avg_rating*agg0.total_non_empty + agg1.avg_rating*agg1.total_non_empty)
+                    /(agg0.total_non_empty+agg1.total_non_empty+1e-9)
+                ),
+                last_interaction_time=agg1.last_interaction_time,
+                next_interaction_time=agg1.next_interaction_time,
+                ratings_histogram=agg0.ratings_histogram + agg1.ratings_histogram,
+                simulation_status=agg1.simulation_status,
+            )
+        else:
+            events=events0
+            agg=agg0
         # make sure event counts match
         if record_events:
             assert agg.n_events==len(events)
         return DiscreteSimulationResult(
             events=events if record_events else None,
-            n_events=agg.n_events,
-            total_wellbeing=agg.total_wellbeing,
-            avg_rating=agg.avg_rating,
-            last_interaction_time=agg.last_interaction,
+            aggregated_results=agg,
             T=ivp.T,
         )
     
@@ -169,19 +188,71 @@ class LotkaVolterraDynamicalSystem:
         ])*y
 
 
+class DiscreteSimulationStatus(enum.Enum):
+    REACHED_TIME_HORIZON = 0
+    EXTINCT_AT_START = 1
+    EXTINCT = 2
+    CALLBACK = 3
+
+
 AggregatedSimulationResult = collections.namedtuple(
     'AggregatedSimulationResult',
-    ['n_events', 'total_wellbeing', 'avg_rating', 'last_interaction'],
+    [
+        'n_events',
+        'total_non_empty',
+        'avg_rating',
+        'last_interaction_time',
+        'next_interaction_time',
+        'ratings_histogram',
+        'simulation_status',
+    ],
 )
 
 DiscreteSimulationEvent = collections.namedtuple(
     'DiscreteSimulationEvent',
-    [ 't', 'y', 'feedback', 'avg_beta', 'avg_delta'],
+    [
+        't',
+        'y',
+        'feedback',
+        'avg_beta',
+        'avg_delta',
+        'p_fb',
+    ],
+)
+
+LotkaVolterraSystemParams = collections.namedtuple(
+    'LotkaVolterraSystemParams',
+    [
+        'alpha',
+        'beta',
+        'gamma',
+        'delta',
+    ],
 )
 
 RateLimitParams = collections.namedtuple(
     'RateLimitParams',
-    ['lookback_n','rate_threshold','cooldown_period'],
+    [
+        'lookback_n',
+        'rate_upper_bound',
+        'cooldown_period',
+    ],
+)
+
+AdaptiveRatingsPolicyParams = collections.namedtuple(
+    'AdaptiveRatingsPolicyParams',
+    [
+        'callback_f',
+        'callback_time',
+        'rating_sampling_rate',
+    ],
+)
+
+_AdaptiveRatingsPolicyInternalParams = collections.namedtuple(
+    '_AdaptiveRatingsPolicyInternalParams',
+    [
+        'rating_sampling_rate',
+    ],
 )
 
 @njit
@@ -190,33 +261,49 @@ def random_seed(n):
 
 @njit
 def _simulate_discrete_optimized(
-    alpha: np.array,
-    beta: np.array,
-    gamma: np.array,
-    delta: np.array,
-    y_0: np.array,
+    lv_params: LotkaVolterraSystemParams,
+    y0: np.array,
+    t0: float,
     T: float,
     p_fb: float,
     item_probabilities: np.array,
     true_ratings: np.array,
     batch_size: int,
     rate_limit_params: RateLimitParams,
+    adaptive_policy_params: _AdaptiveRatingsPolicyInternalParams,
     record_events: bool = True,
 ):
-    t = 0.0
-    y = np.copy(y_0)
+    alpha = lv_params.alpha
+    beta = lv_params.beta
+    gamma = lv_params.gamma
+    delta = lv_params.delta
+    t = t0
+    y = np.copy(y0)
     events = []
     n_events = 0
-    total_wellbeing = 0
     total_non_empty = 0
     total_rating = 0
     last_interaction_time = 0
     cooldown_end=0
+    ratings_histogram=np.zeros(5)
     if y[0]<=0:
-        return events, AggregatedSimulationResult(0,0.0,0.0,0.0)
+        return (
+            events,
+            AggregatedSimulationResult(
+                n_events=0,
+                total_non_empty=0,
+                avg_rating=0.0,
+                last_interaction_time=0.0,
+                next_interaction_time=0.0,
+                ratings_histogram=ratings_histogram,
+                simulation_status=DiscreteSimulationStatus.EXTINCT_AT_START,
+            )
+        )
     dt = 1/y[0]
+    next_interaction_time = dt
     item_cdf = np.cumsum(item_probabilities)
     assert abs(item_cdf[-1]-1)<=1e-5
+    return_status = DiscreteSimulationStatus.REACHED_TIME_HORIZON
     while t<T and (y>0).all():
         last_interaction_time = t
         explicit_feedback = []
@@ -224,20 +311,26 @@ def _simulate_discrete_optimized(
         total_beta = 0
         total_delta = 0
         for batch_ind in range(batch_size):
-            fb = (np.random.rand() <= p_fb) or (t<cooldown_end) # forced break decision
+            # stochastic recommendation    
+            selected_item = np.searchsorted(item_cdf, np.random.rand(), side='right')
+            item_rating = true_ratings[selected_item]
+            item_beta = beta[item_rating-1]
+            fb = (  # forced break decision
+                (np.random.rand() <= p_fb)
+                or (t<cooldown_end)
+            )
             if fb:
                 if record_events:
                     explicit_feedback.append(None)
             else:
-                # stochastic recommendation
-                num_non_empty += 1
-                selected_item = np.searchsorted(item_cdf, np.random.rand(), side='right')
-                true_rating = true_ratings[selected_item]
+                num_non_empty += 1    
                 if record_events:
-                    explicit_feedback.append((selected_item, true_rating))
-                total_rating += true_rating
-                total_beta += beta[true_rating-1]
+                    explicit_feedback.append((selected_item, item_rating))
+                total_rating += item_rating
+                total_beta += item_beta
                 total_delta += delta
+                if (adaptive_policy_params is None) or (np.random.rand() <= adaptive_policy_params.rating_sampling_rate):
+                    ratings_histogram[item_rating-1] += 1
         avg_beta = total_beta / batch_size
         avg_delta = total_delta / batch_size
         if record_events:
@@ -247,33 +340,141 @@ def _simulate_discrete_optimized(
                 feedback=explicit_feedback,
                 avg_beta=avg_beta,
                 avg_delta=avg_delta,
+                p_fb=p_fb,
             ))
             if rate_limit_params is not None:
                 if n_events>rate_limit_params.lookback_n:
                     lookback_dt = t-events[-(rate_limit_params.lookback_n+1)].t
                     lookback_rate = rate_limit_params.lookback_n/lookback_dt
-                    if lookback_rate>rate_limit_params.rate_threshold:
+                    if lookback_rate>rate_limit_params.rate_upper_bound:
                         cooldown_end = math.ceil(t/rate_limit_params.cooldown_period)*rate_limit_params.cooldown_period
         n_events += 1
-        total_wellbeing += y[1]
         total_non_empty += num_non_empty
         # advance system
         y += np.array([
             -alpha + avg_beta*y[1],
             gamma*(1-y[1]) - avg_delta*y[0],
-        ])*y*dt
-        # next timestamp is 1/rate
+        ])*y
         if y[0]<=0:
+            return_status = DiscreteSimulationStatus.EXTINCT
             break
-        # dt = 0.01
+        # next timestamp is 1/rate
         dt = 1/y[0]
         t += dt
+        next_interaction_time = t
     return (
         events,
         AggregatedSimulationResult(
             n_events=n_events,
-            total_wellbeing=total_wellbeing,
+            total_non_empty=total_non_empty,
             avg_rating=total_rating/total_non_empty if total_non_empty>0 else 0.0,
-            last_interaction=last_interaction_time,
+            last_interaction_time=last_interaction_time,
+            next_interaction_time=next_interaction_time,
+            ratings_histogram=ratings_histogram,
+            simulation_status=return_status,
+        ),
+    )
+
+
+#
+# Stateless behavioral model
+#
+
+class StatelessBehavioralModel:
+    def __init__(self, tau):
+        self.tau = tau
+
+    def simulate_discrete(self, ivp, recommender, batch_size=1, record_events=True):
+        events, agg = _simulate_stateless_optimized(
+            tau=self.tau,
+            T=ivp.T,
+            p_fb=recommender.p_fb,
+            item_probabilities=recommender.item_probabilities(),
+            true_ratings=recommender.true_ratings,
+            batch_size=batch_size,
+            record_events=record_events,
+        )
+        # make sure event counts match
+        if record_events:
+            assert agg.n_events==len(events)
+        return DiscreteSimulationResult(
+            events=events if record_events else None,
+            aggregated_results=agg,
+            T=ivp.T,
+        )
+
+StatelessSimulationEvent = collections.namedtuple(
+    'StatelessSimulationEvent',
+    [
+        't',
+        'feedback',
+        'p_fb',
+    ],
+)
+
+@njit
+def _simulate_stateless_optimized(
+    tau: float,
+    T: float,
+    p_fb: float,
+    item_probabilities: np.array,
+    true_ratings: np.array,
+    batch_size: int,
+    record_events: bool = True,
+):
+    t = 0.0
+    events = []
+    n_events = 0
+    total_non_empty = 0
+    total_rating_overall = 0.0
+    last_interaction_time = 0.0
+    ratings_histogram=np.zeros(5)
+    next_interaction_time = 0.0
+    item_cdf = np.cumsum(item_probabilities)
+    assert abs(item_cdf[-1]-1)<=1e-5
+    return_status = DiscreteSimulationStatus.REACHED_TIME_HORIZON
+    while t<T:
+        last_interaction_time = t
+        explicit_feedback = []
+        num_non_empty = 0
+        total_rating_batch = 0
+        for batch_ind in range(batch_size):
+            # stochastic recommendation
+            selected_item = np.searchsorted(item_cdf, np.random.rand(), side='right')
+            item_rating = true_ratings[selected_item]
+            fb = (np.random.rand() <= p_fb)  # forced break decision
+            if fb:
+                if record_events:
+                    explicit_feedback.append(None)
+            else:
+                num_non_empty += 1
+                if record_events:
+                    explicit_feedback.append((selected_item, item_rating))
+                total_rating_overall += item_rating
+                total_rating_batch += item_rating
+                ratings_histogram[item_rating-1] += 1
+        if record_events:
+            events.append(StatelessSimulationEvent(
+                t=t,
+                feedback=explicit_feedback,
+                p_fb=p_fb,
+            ))
+        n_events += 1
+        total_non_empty += num_non_empty
+        # advance system
+        avg_rating_batch = total_rating_batch/batch_size
+        dt = 1/(tau*avg_rating_batch+1e-6)
+        t += dt
+        next_interaction_time = t
+    return (
+        events,
+        AggregatedSimulationResult(
+            n_events=n_events,
+            total_non_empty=total_non_empty,
+            avg_rating=total_rating_overall/total_non_empty if total_non_empty>0 else 0.0,
+            last_interaction_time=last_interaction_time,
+            next_interaction_time=next_interaction_time,
+            ratings_histogram=ratings_histogram,
+            simulation_status=return_status,
         ),
     )

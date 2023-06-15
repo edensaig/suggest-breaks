@@ -1,6 +1,7 @@
 import contextlib
 import datetime
 import re
+import numpy as np
 
 __all__=[
     'ExperimentParamTracker',
@@ -12,7 +13,7 @@ class ExperimentParamTracker:
         self.params_dct = {}
 
     def declare_param(self, value, name):
-        assert not ((name in self.params_dct) and (self.params_dct[name]!=value))
+        assert not ((name in self.params_dct) and np.any(self.params_dct[name]!=value))
         # assert name not in self.params_dct
         # assert name.isalpha()
         self.params_dct[name] = value
